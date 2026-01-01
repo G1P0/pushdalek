@@ -1,0 +1,20 @@
+# local env / secrets
+.env
+.env.*
+
+# sqlite db
+bot.db
+*.db
+*.sqlite
+*.sqlite3
+
+# go build artifacts
+/bin/
+/dist/
+*.exe
+*.out
+
+# editor / OS мусор
+.DS_Store
+.idea/
+.vscode/
