@@ -71,14 +71,23 @@ func main() {
 
 		// /whoami доступна всем
 		if upd.Message.IsCommand() && upd.Message.Command() == "whoami" {
-			txt := fmt.Sprintf("user_id=%d\nchat_id=%d", userID, chatID)
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, txt))
+			reply(bot, chatID, fmt.Sprintf("user_id=%d\nchat_id=%d", userID, chatID))
+			continue
+		}
+
+		// start/help тоже доступен всем, но меню показываем только админам
+		if upd.Message.IsCommand() && (upd.Message.Command() == "start" || upd.Message.Command() == "help") {
+			if isAdmin(adminIDs, userID) {
+				sendMenu(bot, chatID)
+			} else {
+				reply(bot, chatID, "🚫 Нет доступа.\nСделай /whoami и добавь свой user_id в TG_ADMIN_IDS, потом перезапусти бота.")
+			}
 			continue
 		}
 
 		// команды кроме /whoami — только админы
 		if upd.Message.IsCommand() && !isAdmin(adminIDs, userID) {
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, "🚫 Нет доступа"))
+			reply(bot, chatID, "🚫 Нет доступа")
 			continue
 		}
 
@@ -92,15 +101,17 @@ func main() {
 
 		case "sync":
 			doSync(bot, st, chatID, vkToken, vkOwner)
+			sendMenu(bot, chatID)
 
 		case "next":
 			doNext(bot, st, chatID, archiveTag, 1)
+			sendMenu(bot, chatID)
 
 		case "next5":
 			doNext(bot, st, chatID, archiveTag, 5)
+			sendMenu(bot, chatID)
 
 		case "used":
-			// /used [page]
 			page := 0
 			if a := strings.TrimSpace(upd.Message.CommandArguments()); a != "" {
 				if n, err := strconv.Atoi(a); err == nil && n >= 0 {
@@ -110,7 +121,7 @@ func main() {
 			sendUsedPage(bot, st, chatID, 0, page)
 
 		default:
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Не знаю такую команду. Жми Menu или /help"))
+			reply(bot, chatID, "Не знаю такую команду. Жми Menu или /help")
 		}
 	}
 }
@@ -133,16 +144,18 @@ func handleCallback(bot *tgbotapi.BotAPI, st *store.Store, cq *tgbotapi.Callback
 	parts := strings.Split(data, ":")
 
 	switch parts[0] {
+	case "noop":
+		// ничего
+
 	case "menu":
 		editMenu(bot, chatID, msgID)
 
 	case "whoami":
-		txt := fmt.Sprintf("user_id=%d\nchat_id=%d", userID, chatID)
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, txt))
+		reply(bot, chatID, fmt.Sprintf("user_id=%d\nchat_id=%d", userID, chatID))
 
 	case "stats":
 		stats, _ := st.Stats()
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, formatStats(stats)))
+		reply(bot, chatID, formatStats(stats))
 		sendMenu(bot, chatID)
 
 	case "sync":
@@ -181,47 +194,38 @@ func handleCallback(bot *tgbotapi.BotAPI, st *store.Store, cq *tgbotapi.Callback
 
 		p, err := st.GetByVKFullID(vkFull)
 		if err != nil || p == nil {
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Не нашёл этот пост в БД."))
+			reply(bot, chatID, "Не нашёл этот пост в БД.")
 			return
 		}
 		sendUsedDetails(bot, chatID, msgID, page, p)
 
-	case "set":
-		// set:<status>:<vkfullid>:<page>
-		if len(parts) < 4 {
+	case "setnew":
+		// setnew:<vkfullid>:<page>
+		if len(parts) < 3 {
 			return
 		}
-		status := parts[1]
-		vkFull := parts[2]
+		vkFull := parts[1]
 		page := 0
-		_ = tryAtoi(parts[3], &page)
+		_ = tryAtoi(parts[2], &page)
 
-		if status != "new" && status != "skipped" && status != "used" && status != "reserved" {
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, "Статус какой-то странный."))
+		if err := st.SetStatus(vkFull, "new"); err != nil {
+			reply(bot, chatID, fmt.Sprintf("Ошибка БД: %v", err))
 			return
 		}
-
-		if err := st.SetStatus(vkFull, status); err != nil {
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка БД: %v", err)))
-			return
-		}
-
-		// после смены статуса возвращаемся к used-странице
 		sendUsedPage(bot, st, chatID, msgID, page)
 
 	default:
-		sendMenu(bot, chatID)
-
+		editMenu(bot, chatID, msgID)
 	}
 }
 
 func doSync(bot *tgbotapi.BotAPI, st *store.Store, chatID int64, vkToken, vkOwner string) {
-	_, _ = bot.Send(tgbotapi.NewMessage(chatID, "🔄 Синхронизирую с VK..."))
+	reply(bot, chatID, "🔄 Синхронизирую с VK...")
 
 	c := vk.New(vkToken, vkOwner)
 	items, err := c.FetchWall(200)
 	if err != nil {
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка VK: %v", err)))
+		reply(bot, chatID, fmt.Sprintf("Ошибка VK: %v", err))
 		return
 	}
 
@@ -240,12 +244,12 @@ func doSync(bot *tgbotapi.BotAPI, st *store.Store, chatID int64, vkToken, vkOwne
 
 	ins, err := st.UpsertPosts(posts)
 	if err != nil {
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка БД: %v", err)))
+		reply(bot, chatID, fmt.Sprintf("Ошибка БД: %v", err))
 		return
 	}
 
 	stats, _ := st.Stats()
-	_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Добавлено %d новых.\n%s", ins, formatStats(stats))))
+	reply(bot, chatID, fmt.Sprintf("✅ Добавлено %d новых.\n%s", ins, formatStats(stats)))
 }
 
 func doNext(bot *tgbotapi.BotAPI, st *store.Store, chatID int64, archiveTag string, n int) {
@@ -258,9 +262,9 @@ func doNext(bot *tgbotapi.BotAPI, st *store.Store, chatID int64, archiveTag stri
 
 	sent := 0
 	for i := 0; i < n; i++ {
-		p, err := st.PickAndReserveRandom()
+		p, err := st.PickRandomNew()
 		if err != nil {
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка БД: %v", err)))
+			reply(bot, chatID, fmt.Sprintf("Ошибка БД: %v", err))
 			break
 		}
 		if p == nil {
@@ -270,23 +274,24 @@ func doNext(bot *tgbotapi.BotAPI, st *store.Store, chatID int64, archiveTag stri
 		caption := buildCaptionHTML(p.Text, p.Link, archiveTag)
 
 		if err := sendAlbum(bot, chatID, p.MediaURLs, caption); err != nil {
-			// если не отправилось — возвращаем обратно в new, чтобы не “залипло” в reserved
-			_ = st.SetStatus(p.VKFullID, "new")
-			_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка отправки (вернул в new): %v", err)))
+			reply(bot, chatID, fmt.Sprintf("Ошибка отправки: %v", err))
 			break
 		}
 
-		_ = st.SetStatus(p.VKFullID, "used")
+		if err := st.SetStatus(p.VKFullID, "used"); err != nil {
+			reply(bot, chatID, fmt.Sprintf("Ошибка БД (не смог пометить used): %v", err))
+			break
+		}
+
 		sent++
 	}
 
 	stats, _ := st.Stats()
 	if sent == 0 {
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, "⚠️ Нечего отправлять.\n"+formatStats(stats)))
+		reply(bot, chatID, "⚠️ Нечего отправлять.\n"+formatStats(stats))
 		return
 	}
-
-	_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ Отправлено: %d\n%s", sent, formatStats(stats))))
+	reply(bot, chatID, fmt.Sprintf("✅ Отправлено: %d\n%s", sent, formatStats(stats)))
 }
 
 func sendUsedPage(bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int, page int) {
@@ -296,7 +301,7 @@ func sendUsedPage(bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int
 
 	total, err := st.CountByStatus("used")
 	if err != nil {
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка БД: %v", err)))
+		reply(bot, chatID, fmt.Sprintf("Ошибка БД: %v", err))
 		return
 	}
 
@@ -311,7 +316,7 @@ func sendUsedPage(bot *tgbotapi.BotAPI, st *store.Store, chatID int64, msgID int
 	offset := page * perPageUsed
 	items, err := st.ListByStatusPage("used", perPageUsed, offset)
 	if err != nil {
-		_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Ошибка БД: %v", err)))
+		reply(bot, chatID, fmt.Sprintf("Ошибка БД: %v", err))
 		return
 	}
 
@@ -380,7 +385,6 @@ func usedKeyboard(page, maxPage int, items []store.Post) tgbotapi.InlineKeyboard
 		{prev, next, menu},
 	}
 
-	// кнопки “детали” на 1..N
 	if len(items) > 0 {
 		row := []tgbotapi.InlineKeyboardButton{}
 		for i, p := range items {
@@ -403,12 +407,11 @@ func detailsKeyboard(page int, p *store.Post) tgbotapi.InlineKeyboardMarkup {
 	open := tgbotapi.NewInlineKeyboardButtonURL("🔗 Оригинал", p.Link)
 	back := tgbotapi.NewInlineKeyboardButtonData("⬅️ Back", fmt.Sprintf("used:%d", page))
 
-	toNew := tgbotapi.NewInlineKeyboardButtonData("↩️ вернуть в new", fmt.Sprintf("set:new:%s:%d", p.VKFullID, page))
-	toSkip := tgbotapi.NewInlineKeyboardButtonData("🚫 skipped", fmt.Sprintf("set:skipped:%s:%d", p.VKFullID, page))
+	toNew := tgbotapi.NewInlineKeyboardButtonData("↩️ вернуть в new", fmt.Sprintf("setnew:%s:%d", p.VKFullID, page))
 
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(open),
-		tgbotapi.NewInlineKeyboardRow(toNew, toSkip),
+		tgbotapi.NewInlineKeyboardRow(toNew),
 		tgbotapi.NewInlineKeyboardRow(back),
 	)
 }
@@ -493,10 +496,11 @@ func buildCaptionHTML(text, link, archiveTag string) string {
 }
 
 func formatStats(m map[string]int) string {
-	get := func(k string) int { return m[k] }
-	return fmt.Sprintf("Статы: new=%d used=%d reserved=%d skipped=%d",
-		get("new"), get("used"), get("reserved"), get("skipped"),
-	)
+	return fmt.Sprintf("Статы: new=%d used=%d", m["new"], m["used"])
+}
+
+func reply(bot *tgbotapi.BotAPI, chatID int64, text string) {
+	_, _ = bot.Send(tgbotapi.NewMessage(chatID, text))
 }
 
 func parseAdminIDs(s string) map[int64]struct{} {

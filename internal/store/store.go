@@ -48,7 +48,7 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) ensureSchema(ctx context.Context) error {
-	// базовая таблица (сразу новая версия)
+	// базовая таблица
 	_, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS posts (
   vk_full_id  TEXT PRIMARY KEY,
@@ -56,26 +56,26 @@ CREATE TABLE IF NOT EXISTS posts (
   vk_post_id  TEXT NOT NULL,
   link        TEXT NOT NULL,
   text        TEXT NOT NULL,
-  media_json  TEXT NOT NULL,
+  media_json  TEXT NOT NULL DEFAULT '[]',
   status      TEXT NOT NULL DEFAULT 'new',
-  created_at  INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL DEFAULT 0,
   updated_at  INTEGER NOT NULL DEFAULT 0,
   used_at     INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_posts_status_usedat ON posts(status, used_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_posts_status_usedat    ON posts(status, used_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_status_createdat ON posts(status, created_at DESC);
 `)
 	if err != nil {
 		return err
 	}
 
-	// миграции для старых баз (если вдруг колонок не было)
+	// миграции для старых баз
 	cols, err := s.tableColumns(ctx, "posts")
 	if err != nil {
 		return err
 	}
 
-	// helper
 	addCol := func(name, ddl string) error {
 		if cols[name] {
 			return nil
@@ -87,25 +87,50 @@ CREATE INDEX IF NOT EXISTS idx_posts_status_createdat ON posts(status, created_a
 	if err := addCol("media_json", `ALTER TABLE posts ADD COLUMN media_json TEXT NOT NULL DEFAULT '[]';`); err != nil {
 		return err
 	}
-	if err := addCol("updated_at", `ALTER TABLE posts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;`); err != nil {
-		return err
-	}
-	if err := addCol("used_at", `ALTER TABLE posts ADD COLUMN used_at INTEGER NOT NULL DEFAULT 0;`); err != nil {
-		return err
-	}
 	if err := addCol("status", `ALTER TABLE posts ADD COLUMN status TEXT NOT NULL DEFAULT 'new';`); err != nil {
 		return err
 	}
 	if err := addCol("created_at", `ALTER TABLE posts ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;`); err != nil {
 		return err
 	}
+	if err := addCol("updated_at", `ALTER TABLE posts ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;`); err != nil {
+		return err
+	}
+	if err := addCol("used_at", `ALTER TABLE posts ADD COLUMN used_at INTEGER NOT NULL DEFAULT 0;`); err != nil {
+		return err
+	}
 
-	// индексы еще раз (безопасно)
 	_, err = s.db.ExecContext(ctx, `
-CREATE INDEX IF NOT EXISTS idx_posts_status_usedat ON posts(status, used_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posts_status_usedat    ON posts(status, used_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_status_createdat ON posts(status, created_at DESC);
 `)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// “убираем reserved/skipped” как класс:
+	// всё что не new/used -> new
+	_, err = s.db.ExecContext(ctx, `
+UPDATE posts
+SET status='new', updated_at=COALESCE(updated_at, 0)
+WHERE status NOT IN ('new','used');
+`)
+	if err != nil {
+		return err
+	}
+
+	// если вдруг были used без used_at — поставим used_at=updated_at/created_at
+	_, _ = s.db.ExecContext(ctx, `
+UPDATE posts
+SET used_at = CASE
+  WHEN used_at=0 AND updated_at>0 THEN updated_at
+  WHEN used_at=0 AND created_at>0 THEN created_at
+  ELSE used_at
+END
+WHERE status='used';
+`)
+
+	return nil
 }
 
 func (s *Store) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
@@ -189,6 +214,7 @@ WHERE vk_full_id=?;
 	return inserted, err
 }
 
+// Stats: считаем только new/used. Всё остальное уже миграцией превращаем в new.
 func (s *Store) Stats() (map[string]int, error) {
 	rows, err := s.db.Query(`SELECT status, COUNT(*) FROM posts GROUP BY status;`)
 	if err != nil {
@@ -197,10 +223,8 @@ func (s *Store) Stats() (map[string]int, error) {
 	defer rows.Close()
 
 	out := map[string]int{
-		"new":      0,
-		"used":     0,
-		"reserved": 0,
-		"skipped":  0,
+		"new":  0,
+		"used": 0,
 	}
 	for rows.Next() {
 		var st string
@@ -208,12 +232,17 @@ func (s *Store) Stats() (map[string]int, error) {
 		if err := rows.Scan(&st, &c); err != nil {
 			return nil, err
 		}
-		out[st] = c
+		if st == "new" || st == "used" {
+			out[st] = c
+		}
 	}
 	return out, rows.Err()
 }
 
 func (s *Store) CountByStatus(status string) (int, error) {
+	if status != "new" && status != "used" {
+		return 0, fmt.Errorf("unsupported status: %s", status)
+	}
 	row := s.db.QueryRow(`SELECT COUNT(*) FROM posts WHERE status=?;`, status)
 	var n int
 	return n, row.Scan(&n)
@@ -236,33 +265,33 @@ WHERE vk_full_id=?;
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(mediaJSON), &p.MediaURLs)
+	// на всякий: если в базе внезапно был старый статус
+	if p.Status != "new" && p.Status != "used" {
+		p.Status = "new"
+	}
 	return &p, nil
 }
 
 func (s *Store) SetStatus(vkFullID, status string) error {
+	if status != "new" && status != "used" {
+		return fmt.Errorf("unsupported status: %s", status)
+	}
 	now := time.Now().Unix()
 	usedAt := int64(0)
 	if status == "used" {
 		usedAt = now
 	}
 	_, err := s.db.Exec(`
-UPDATE posts SET status=?, updated_at=?, used_at=?
+UPDATE posts
+SET status=?, updated_at=?, used_at=?
 WHERE vk_full_id=?;
 `, status, now, usedAt, vkFullID)
 	return err
 }
 
-// Чтобы несколько админов не выдернули один и тот же пост одновременно.
-func (s *Store) PickAndReserveRandom() (*Post, error) {
-	now := time.Now().Unix()
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	row := tx.QueryRow(`
+// PickRandomNew: выбираем случайный new
+func (s *Store) PickRandomNew() (*Post, error) {
+	row := s.db.QueryRow(`
 SELECT vk_owner_id, vk_post_id, vk_full_id, link, text, media_json, status, created_at, updated_at, used_at
 FROM posts
 WHERE status='new'
@@ -279,29 +308,13 @@ LIMIT 1;
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(mediaJSON), &p.MediaURLs)
-
-	// резервируем
-	res, err := tx.Exec(`
-UPDATE posts SET status='reserved', updated_at=?
-WHERE vk_full_id=? AND status='new';
-`, now, p.VKFullID)
-	if err != nil {
-		return nil, err
-	}
-	aff, _ := res.RowsAffected()
-	if aff != 1 {
-		// кто-то успел раньше
-		return nil, nil
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	p.Status = "reserved"
 	return &p, nil
 }
 
 func (s *Store) ListByStatusPage(status string, limit, offset int) ([]Post, error) {
+	if status != "new" && status != "used" {
+		return nil, fmt.Errorf("unsupported status: %s", status)
+	}
 	if limit <= 0 {
 		limit = 10
 	}

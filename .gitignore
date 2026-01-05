@@ -3,6 +3,7 @@
 .env.*
 
 # sqlite db
+/data/
 bot.db
 *.db
 *.sqlite

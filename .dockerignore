@@ -1,0 +1,6 @@
+.env
+bot.db
+data
+bin
+.git
+.DS_Store
